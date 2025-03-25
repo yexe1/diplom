@@ -1,0 +1,115 @@
+- name: Устанавливаем Docker и Kubernetes
+  hosts: kubernetes
+  become: true
+  tasks:
+
+    - name: Устанавливаем зависимости
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Удаляем старые GPG-ключи Kubernetes 
+      shell: |
+        sudo rm -f /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+        sudo rm -f /usr/share/keyrings/kubernetes-archive-keyring.gpg
+        sudo apt-key del 234654DA9A296436 || true
+      ignore_errors: yes
+
+    - name: Загружаем и добавляем новый GPG-ключ Kubernetes (правильный способ)
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+        sudo chmod 644 /usr/share/keyrings/kubernetes-archive-keyring.gpg
+
+    - name: Проверяем, добавлен ли GPG-ключ (должен быть `pub`)
+      shell: gpg --show-keys /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      register: gpg_check
+      changed_when: false
+
+    - name: Выводим GPG-ключ (должен быть `pub` key)
+      debug:
+        msg: "{{ gpg_check.stdout_lines }}"
+
+    - name: Удаляем старый репозиторий Kubernetes 
+      file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+
+    - name: Добавляем новый Kubernetes-репозиторий
+      shell: |
+        echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Обновляем apt cache 
+      apt:
+        update_cache: yes
+
+    - name: Проверяем, установлен ли Docker
+      shell: docker --version
+      register: docker_installed
+      ignore_errors: true
+      changed_when: false
+
+    - name: Устанавливаем Docker 
+      get_url:
+        url: "https://get.docker.com"
+        dest: "/tmp/get-docker.sh"
+        mode: '0755'
+      when: docker_installed.rc != 0
+
+    - name: Запускаем установку Docker
+      shell: sh /tmp/get-docker.sh
+      when: docker_installed.rc != 0
+
+    - name: Добавляем пользователя ubuntu в группу docker
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Отключаем swap 
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^/#/' /etc/fstab
+
+    - name: Проверяем, установлен ли kubeadm
+      command: which kubeadm
+      register: kubeadm_installed
+      ignore_errors: true
+      changed_when: false
+
+    - name: Устанавливаем kubeadm, kubelet, kubectl 
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+      when: kubeadm_installed.rc != 0
+
+    - name: Разрешаем SSH перед включением UFW 
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Настраиваем firewall
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "6443"    # API Server
+        - "2379"    # etcd
+        - "2380"    # etcd
+        - "10250"   # Kubelet API
+        - "10255"   # Kubelet
+        - "30000"   # NodePort range
+        - "32767"   # NodePort range
+
+    - name: Включаем firewall без ожидания подтверждения
+      shell: echo "y" | ufw enable || true
